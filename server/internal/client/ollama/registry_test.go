@@ -813,8 +813,15 @@ func TestPullChunksums(t *testing.T) {
 	)
 	err := rc.Pull(ctx, "test")
 	check(err)
-	if !slices.Equal(reads, []int64{0, 3, 5}) {
-		t.Errorf("reads = %v; want %v", reads, []int64{0, 3, 5})
+	wantReads := []int64{
+		0, // initial signaling of layer pull starting
+		3, // first chunk read
+		0, // end of first chunk (without error)
+		2, // second chunk read
+		0, // end of second chunk (without error)
+	}
+	if !slices.Equal(reads, wantReads) {
+		t.Errorf("reads = %v; want %v", reads, wantReads)
 	}
 
 	mw, err := rc.Resolve(t.Context(), "test")
