@@ -9,7 +9,8 @@ package ggml
 import "C"
 
 import (
-	"errors"
+	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
@@ -18,6 +19,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 	"unicode"
 	"unsafe"
 
@@ -299,10 +302,15 @@ func New(r *os.File, params ml.BackendParams) (ml.Backend, error) {
 
 	// concurrently read in tensor data. uses a section reader which is safe for concurrent reads
 	sr := io.NewSectionReader(r, int64(meta.Tensors().Offset), n-int64(meta.Tensors().Offset))
-	var g errgroup.Group
+
+	var doneCount atomic.Uint32
+
+	g, ctx := errgroup.WithContext(context.Background())
 	for _, t := range meta.Tensors().Items() {
-		for _, target := range targets[t.Name] {
-			g.Go(func() error {
+		g.Go(func() error {
+			tts := make([]*C.struct_ggml_tensor, max(1, len(targets[t.Name])))
+			for i := range tts {
+				target := targets[t.Name][i]
 				if target == "" {
 					target = t.Name
 				}
@@ -312,23 +320,52 @@ func New(r *os.File, params ml.BackendParams) (ml.Backend, error) {
 					return fmt.Errorf("unassigned tensor: %s", t.Name)
 				}
 
-				bts := C.malloc(C.size_t(t.Size()))
-				if bts == nil {
-					return errors.New("failed to allocate tensor buffer")
-				}
-				defer C.free(bts)
+				tts[i] = tt
+			}
 
-				buf := unsafe.Slice((*byte)(bts), t.Size())
-				n, err := io.ReadFull(io.NewSectionReader(sr, int64(t.Offset), int64(t.Size())), buf)
-				if err != nil || n != len(buf) {
-					return errors.New("read failed")
+			bsr := bufio.NewReader(io.NewSectionReader(sr, int64(t.Offset), int64(t.Size())))
+			bts := make([]byte, 32*format.KibiByte)
+
+			var s uint64
+			for s < t.Size() {
+				n, err := io.ReadFull(bsr, bts[:min(len(bts), int(t.Size()-s))])
+				if err != nil {
+					return err
 				}
 
-				C.ggml_backend_tensor_set(tt, bts, 0, C.size_t(t.Size()))
-				return nil
-			})
-		}
+				for _, tt := range tts {
+					func() {
+						cbytes := C.CBytes(bts[:n])
+						defer C.free(cbytes)
+						C.ggml_backend_tensor_set(tt, cbytes, C.size_t(s), C.size_t(n))
+					}()
+				}
+
+				s += uint64(n)
+			}
+
+			doneCount.Add(1)
+			return nil
+		})
 	}
+
+	go func() {
+		totalCount := len(meta.Tensors().Items())
+		ticker := time.NewTicker(20 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+			case <-ticker.C:
+			}
+
+			done := doneCount.Load()
+			slog.Info("loading progress", "done", done, "total", totalCount)
+			if done >= uint32(totalCount) {
+				break
+			}
+		}
+	}()
 
 	if err := g.Wait(); err != nil {
 		return nil, err
