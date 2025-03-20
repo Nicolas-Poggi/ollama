@@ -4,7 +4,7 @@
   </a>
 </div>
 
-# Ollama
+# Ollama - Nicolas
 
 Get up and running with large language models.
 
